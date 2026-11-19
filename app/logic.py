@@ -104,6 +104,14 @@ def fmt_ts(ts):
     return body + " UTC"
 
 
+def fmt_sign(d):
+    """带显式正负号的十进制文本（正数加 '+'，零不加）。"""
+    d = d if isinstance(d, Decimal) else Decimal(d)
+    if d > 0:
+        return "+" + value_str(d)
+    return value_str(d)
+
+
 # ---------------------------------------------------------------- CSV 解析
 
 def _iter_rows(text, required):
@@ -329,3 +337,218 @@ def apply_swaps(conn, upload_id, keys):
         )
         applied += 1
     return applied, skipped
+
+
+# ---------------------------------------------------------------- 接线台账
+
+def parse_ledger_csv(text):
+    """解析接线台账 CSV（表头 master,sub,start,end），返回 (rows, 原始数据行数)。
+
+    rows 形如 {'master', 'sub', 'start', 'end'}（规范化时刻，时段左闭右开）。
+    校验规则（任一违反即 CsvError，整份拒绝）：
+    - 时段非空：start < end（左闭右开）；
+    - 同一分表的时段不得重叠（端点相接不算重叠）；
+    - 同一时刻一块表不能兼作总表和分表（含同一行总表 == 分表）。
+    """
+    rows = []
+    raw_count = 0
+    for lineno, cells in _iter_rows(text, ["master", "sub", "start", "end"]):
+        raw_count += 1
+        where = f"第 {lineno} 行："
+        master = cells["master"].strip()
+        sub = cells["sub"].strip()
+        if not master:
+            raise CsvError(f"{where}总表为空")
+        if not sub:
+            raise CsvError(f"{where}分表为空")
+        if len(master) > MAX_POINT_LEN or len(sub) > MAX_POINT_LEN:
+            raise CsvError(f"{where}表计名称过长（>{MAX_POINT_LEN} 字符）")
+        start = parse_ts(cells["start"], where)
+        end = parse_ts(cells["end"], where)
+        if not start < end:
+            raise CsvError(
+                f"{where}时段起点须早于终点（左闭右开的非空时段）："
+                f"{fmt_ts(start)} ~ {fmt_ts(end)}"
+            )
+        if master == sub:
+            raise CsvError(f"{where}总表与分表不能是同一块表（{master}）")
+        rows.append(
+            {"master": master, "sub": sub, "start": start, "end": end,
+             "lineno": lineno}
+        )
+
+    def span(r):
+        return f"[{fmt_ts(r['start'])}, {fmt_ts(r['end'])})（第 {r['lineno']} 行）"
+
+    # 同一分表的时段不得重叠
+    by_sub = defaultdict(list)
+    for r in rows:
+        by_sub[r["sub"]].append(r)
+    for sub, rs in by_sub.items():
+        rs.sort(key=lambda r: r["start"])
+        for a, b in zip(rs, rs[1:]):
+            if b["start"] < a["end"]:
+                raise CsvError(
+                    f"分表 {sub} 的时段重叠：{span(a)} 与 {span(b)}"
+                )
+
+    # 同一时刻一块表不能兼作总表和分表
+    as_master = defaultdict(list)
+    as_sub = defaultdict(list)
+    for r in rows:
+        as_master[r["master"]].append(r)
+        as_sub[r["sub"]].append(r)
+    for meter in sorted(set(as_master) & set(as_sub)):
+        for a in as_master[meter]:
+            for b in as_sub[meter]:
+                if a["start"] < b["end"] and b["start"] < a["end"]:
+                    raise CsvError(
+                        f"表计 {meter} 在同一时刻兼任总表与分表："
+                        f"总表时段 {span(a)} 与分表时段 {span(b)} 相交"
+                    )
+    return rows, raw_count
+
+
+def apply_ledger(conn, upload_id, rows):
+    """整份替换接线台账（先清空再写入）。返回写入条数。
+
+    在调用方的事务内执行；任何失败由调用方回滚，原台账保持不变。
+    """
+    conn.execute("DELETE FROM ledger")
+    for r in rows:
+        conn.execute(
+            "INSERT INTO ledger(master, sub, start_ts, end_ts, upload_id)"
+            " VALUES (?,?,?,?,?)",
+            (r["master"], r["sub"], r["start"], r["end"], upload_id),
+        )
+    return len(rows)
+
+
+# ---------------------------------------------------------------- 线损核查
+
+def day_bounds(day):
+    """UTC 日的 [当日零时, 次日零时) 规范化时刻串。"""
+    d0 = day + "T00:00:00.000000Z"
+    d1 = (parse_day(day) + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000000Z")
+    return d0, d1
+
+
+def split_segments(clipped, d0, d1):
+    """把 [d0, d1) 按分表集合的变化划分时段。
+
+    clipped：已裁剪到 [d0, d1) 的接线时段 [{'sub', 'start', 'end'}]。
+    返回 [{'start', 'end', 'subs'}]（subs 为 frozenset），
+    相邻且分表集合相同的区间已合并，整体恰好覆盖 [d0, d1)。
+    """
+    bounds = {d0, d1}
+    for r in clipped:
+        bounds.add(r["start"])
+        bounds.add(r["end"])
+    pts = sorted(bounds)
+    segments = []
+    for a, b in zip(pts, pts[1:]):
+        subs = frozenset(
+            r["sub"] for r in clipped if r["start"] <= a and r["end"] >= b
+        )
+        if segments and segments[-1]["subs"] == subs:
+            segments[-1]["end"] = b
+        else:
+            segments.append({"start": a, "end": b, "subs": subs})
+    return segments
+
+
+def verify_day(conn, master, day):
+    """线损核查：总表 master 在 UTC 日 day 的逐时段核对结果。
+
+    只读取相关表计（总表 + 当日涉及的分表）在 [当日零时, 次日零时]（含两端）
+    的读数与换表记录；调用方需把整个核查放在同一个读事务里，
+    台账、读数、换表记录即来自同一快照。
+    """
+    d0, d1 = day_bounds(day)
+    rows = conn.execute(
+        "SELECT sub, start_ts, end_ts FROM ledger"
+        " WHERE master = ? AND start_ts < ? AND end_ts > ?"
+        " ORDER BY start_ts, sub",
+        (master, d1, d0),
+    ).fetchall()
+    clipped = [
+        {
+            "sub": r["sub"],
+            "start": max(r["start_ts"], d0),
+            "end": min(r["end_ts"], d1),
+        }
+        for r in rows
+    ]
+    meters = sorted({master} | {r["sub"] for r in clipped})
+
+    readings = {m: {} for m in meters}   # meter -> {ts: Decimal}
+    swaps = {m: [] for m in meters}      # meter -> [ts]
+    marks = ",".join("?" * len(meters))
+    for r in conn.execute(
+        f"SELECT point, ts, value FROM readings"
+        f" WHERE point IN ({marks}) AND ts >= ? AND ts <= ?",
+        (*meters, d0, d1),
+    ):
+        readings[r["point"]][r["ts"]] = Decimal(r["value"])
+    for r in conn.execute(
+        f"SELECT point, ts FROM swaps"
+        f" WHERE point IN ({marks}) AND ts >= ? AND ts <= ? ORDER BY ts",
+        (*meters, d0, d1),
+    ):
+        swaps[r["point"]].append(r["ts"])
+
+    segments = []
+    all_ok = True
+    total = Decimal(0)
+    for seg in split_segments(clipped, d0, d1):
+        s, e = seg["start"], seg["end"]
+        subs = sorted(seg["subs"])
+        item = {"start": s, "end": e, "subs": subs}
+        if not subs:
+            item["status"] = "unwired"  # 该时段未接线
+            all_ok = False
+        else:
+            involved = [master] + subs
+            missing = [
+                {"meter": m, "ts": t, "where": w}
+                for m in involved
+                for t, w in ((s, "起点"), (e, "终点"))
+                if t not in readings[m]
+            ]
+            # 段内换表：含右端、不含左端，即 s < 换表时刻 <= e
+            swap_hits = [
+                {"meter": m, "ts": t}
+                for m in involved
+                for t in swaps[m]
+                if s < t <= e
+            ]
+            if missing or swap_hits:
+                item["status"] = "blocked"
+                item["missing"] = sorted(
+                    missing, key=lambda x: (x["ts"], x["meter"])
+                )
+                item["swaps"] = sorted(
+                    swap_hits, key=lambda x: (x["ts"], x["meter"])
+                )
+                all_ok = False
+            else:
+                master_delta = readings[master][e] - readings[master][s]
+                sub_deltas = [
+                    (sub, readings[sub][e] - readings[sub][s]) for sub in subs
+                ]
+                diff = master_delta - sum((d for _, d in sub_deltas), Decimal(0))
+                item.update(
+                    status="ok",
+                    master_delta=master_delta,
+                    sub_deltas=sub_deltas,
+                    diff=diff,
+                )
+                total += diff
+        segments.append(item)
+    return {
+        "master": master,
+        "day": day,
+        "meters": meters,
+        "segments": segments,
+        "total": total if all_ok else None,  # 全天各段均可核对才有全天差额
+    }

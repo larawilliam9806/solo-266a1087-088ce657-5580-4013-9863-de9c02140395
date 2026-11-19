@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}线损核查 - 电量日核算{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>上传接线台账（整份替换）</h2>
+  <form method="post" action="{{ url_for('main.upload', kind='ledger') }}" enctype="multipart/form-data">
+    <p class="hint">表头 <code>master,sub,start,end</code>：总表、分表、UTC 起止时刻。
+      接线时段左闭右开；同一分表的时段不得重叠；同一时刻一块表不能兼作总表和分表。
+      每次上传整份替换现有台账，校验或保存失败时保留原台账。</p>
+    <input type="file" name="file" accept=".csv" required>
+    <button type="submit">上传台账</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>当前台账</h2>
+  {% if ledger %}
+  <table>
+    <thead><tr><th>总表</th><th>分表</th><th>开始（含）</th><th>结束（不含）</th></tr></thead>
+    <tbody>
+      {% for r in ledger %}
+      <tr>
+        <td>{{ r['master'] }}</td>
+        <td>{{ r['sub'] }}</td>
+        <td>{{ r['start_ts'] | fmt_ts }}</td>
+        <td>{{ r['end_ts'] | fmt_ts }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">暂无台账，请先上传接线台账 CSV。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>线损核查</h2>
+  <form method="get" action="{{ url_for('main.loss') }}" class="query">
+    <label>总表
+      <select name="master" required>
+        <option value="" disabled {{ 'selected' if not master }}>请选择</option>
+        {% for m in masters %}
+        <option value="{{ m }}" {{ 'selected' if m == master }}>{{ m }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>UTC 日期 <input type="date" name="day" value="{{ day }}"></label>
+    <button type="submit">核查</button>
+    <span class="hint">不填日期时默认今天（UTC）；按分表集合的变化划分时段</span>
+  </form>
+  {% if not masters %}<p class="hint">暂无总表，请先上传台账。</p>{% endif %}
+</section>
+
+{% if error %}
+<div class="flash error">{{ error }}</div>
+{% endif %}
+
+{% if result %}
+<section class="card">
+  <h2>总表 {{ result.master }}：{{ result.day }}（UTC）</h2>
+  {% if result.total is not none %}
+  <p>全天各段均可核对，全天差额（总表增量 − 各分表增量之和）：
+     <strong>{{ result.total | fmt_sign }} kWh</strong>
+     （数据版本 v{{ version }}）</p>
+  {% else %}
+  <p class="hint">存在不可核对的时段（未接线 / 缺读 / 换表），全天差额不予显示。
+     （数据版本 v{{ version }}）</p>
+  {% endif %}
+  <table>
+    <thead>
+      <tr>
+        <th>时段（左闭右开，UTC）</th><th>分表</th><th>总表增量 (kWh)</th>
+        <th>分表增量 (kWh)</th><th>差额 (kWh)</th><th>核对结果</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for seg in result.segments %}
+      <tr class="{{ 'segok' if seg.status == 'ok' else 'segbad' }}">
+        <td>{{ seg.start | fmt_ts }} ~ {{ seg.end | fmt_ts }}</td>
+        <td>{{ seg.subs | join('、') if seg.subs else '（未接线）' }}</td>
+        {% if seg.status == 'ok' %}
+        <td class="num">{{ seg.master_delta | fmt_num }}</td>
+        <td class="num">
+          {% for sub, d in seg.sub_deltas %}{{ sub }}：{{ d | fmt_num }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+        </td>
+        <td class="num">{{ seg.diff | fmt_sign }}</td>
+        <td>可核算</td>
+        {% elif seg.status == 'unwired' %}
+        <td colspan="3">—</td>
+        <td>该时段未接线，需补台账</td>
+        {% else %}
+        <td colspan="3">—</td>
+        <td>
+          {% for m in seg.missing %}
+          缺读：{{ m.meter }} 在 {{ m.ts | fmt_ts }}（时段{{ m.where }}）无实测读数<br>
+          {% endfor %}
+          {% for s in seg.swaps %}
+          换表：{{ s.meter }} 在 {{ s.ts | fmt_ts }} 发生换表<br>
+          {% endfor %}
+        </td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}

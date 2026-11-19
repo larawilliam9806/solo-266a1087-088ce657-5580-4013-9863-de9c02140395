@@ -28,6 +28,15 @@ CREATE TABLE IF NOT EXISTS swaps (
     upload_id INTEGER NOT NULL REFERENCES uploads(id),
     PRIMARY KEY (point, ts)
 );
+
+CREATE TABLE IF NOT EXISTS ledger (
+    master    TEXT NOT NULL,              -- 总表
+    sub       TEXT NOT NULL,              -- 分表
+    start_ts  TEXT NOT NULL,              -- 接线开始（含），规范化 UTC 时刻
+    end_ts    TEXT NOT NULL,              -- 接线结束（不含），规范化 UTC 时刻
+    upload_id INTEGER NOT NULL REFERENCES uploads(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_master ON ledger(master, start_ts);
 """
 
 

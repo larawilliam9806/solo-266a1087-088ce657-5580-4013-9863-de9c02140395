@@ -15,7 +15,10 @@ header {
 }
 header h1 { margin: 0; font-size: 20px; }
 header a { color: #fff; text-decoration: none; }
-.version { font-size: 13px; opacity: 0.85; }
+header nav { display: flex; gap: 14px; font-size: 14px; }
+header nav a { opacity: 0.9; }
+header nav a:hover { opacity: 1; text-decoration: underline; }
+.version { font-size: 13px; opacity: 0.85; margin-left: auto; }
 main { max-width: 1000px; margin: 20px auto; padding: 0 16px; }
 .card {
   background: #fff;
@@ -54,6 +57,8 @@ th { background: #f0f3f6; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr.gapday td { background: #fdf3e3; }
 tr.rejected td { color: #999; }
+tr.segok td { background: #f2faf2; }
+tr.segbad td { background: #fdf3e3; }
 .flash {
   border-radius: 6px;
   padding: 10px 14px;

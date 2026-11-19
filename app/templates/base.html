@@ -9,6 +9,10 @@
 <body>
 <header>
   <h1><a href="{{ url_for('main.index') }}">电量日核算</a></h1>
+  <nav>
+    <a href="{{ url_for('main.index') }}">上传与查询</a>
+    <a href="{{ url_for('main.loss') }}">线损核查</a>
+  </nav>
   <span class="version">数据版本 v{{ version }}</span>
 </header>
 <main>

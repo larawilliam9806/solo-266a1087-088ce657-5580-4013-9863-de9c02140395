@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from flask import (
     Blueprint,
@@ -17,7 +17,7 @@ from .db import get_db
 
 bp = Blueprint("main", __name__)
 
-KIND_NAMES = {"readings": "读数", "swaps": "换表"}
+KIND_NAMES = {"readings": "读数", "swaps": "换表", "ledger": "台账"}
 
 
 def data_version(conn):
@@ -77,27 +77,31 @@ def index():
 def upload(kind):
     if kind not in KIND_NAMES:
         abort(404)
+    # 台账在线损核查页整份上传，失败后回到核查页；其余回首页
+    target = "main.loss" if kind == "ledger" else "main.index"
     f = request.files.get("file")
     if f is None or not f.filename:
         flash("请选择要上传的 CSV 文件", "error")
-        return redirect(url_for("main.index"))
+        return redirect(url_for(target))
     try:
         text = f.read().decode("utf-8-sig")
     except UnicodeDecodeError:
         flash("上传被拒绝：文件编码须为 UTF-8", "error")
-        return redirect(url_for("main.index"))
+        return redirect(url_for(target))
 
     conn = get_db()
     # 1) 解析与格式校验（不进事务）
     try:
         if kind == "readings":
             parsed, raw_count = logic.parse_readings_csv(text)
-        else:
+        elif kind == "swaps":
             parsed, raw_count = logic.parse_swaps_csv(text)
+        else:
+            parsed, raw_count = logic.parse_ledger_csv(text)
     except logic.CsvError as e:
         record_rejected(conn, kind, f.filename, str(e), 0)
         flash(f"上传被拒绝：{e}", "error")
-        return redirect(url_for("main.index"))
+        return redirect(url_for(target))
 
     # 2) 单个写事务：原始记录与受影响结果一起生效；失败整体回滚，保持旧数据
     conn.execute("BEGIN IMMEDIATE")
@@ -110,9 +114,13 @@ def upload(kind):
         upload_id = cur.lastrowid
         if kind == "readings":
             applied, skipped = logic.apply_readings(conn, upload_id, parsed)
-        else:
+            msg = f"接收 {raw_count} 行，新增 {applied} 条，重复跳过 {skipped} 条"
+        elif kind == "swaps":
             applied, skipped = logic.apply_swaps(conn, upload_id, parsed)
-        msg = f"接收 {raw_count} 行，新增 {applied} 条，重复跳过 {skipped} 条"
+            msg = f"接收 {raw_count} 行，新增 {applied} 条，重复跳过 {skipped} 条"
+        else:
+            applied = logic.apply_ledger(conn, upload_id, parsed)
+            msg = f"接收 {raw_count} 行，台账已整份替换为 {applied} 条接线时段"
         conn.execute(
             "UPDATE uploads SET rows_applied = ?, message = ? WHERE id = ?",
             (applied, msg, upload_id),
@@ -126,7 +134,7 @@ def upload(kind):
     except sqlite3.OperationalError as e:
         conn.execute("ROLLBACK")
         flash(f"系统繁忙，请重试（{e}）", "error")
-    return redirect(url_for("main.index"))
+    return redirect(url_for(target))
 
 
 def _resolve_range(conn, point, start, end):
@@ -215,4 +223,97 @@ def api_usage():
             for d in days
         ],
         gaps=[{"start": g["start"], "end": g["end"]} for g in gaps],
+    )
+
+
+# ---------------------------------------------------------------- 线损核查
+
+def _loss_query(conn, master, day):
+    """在当前读事务内执行核查，返回 (result, error)。day 缺省取今天（UTC）。"""
+    if not master:
+        return None, None
+    if not day:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        day = logic.parse_day(day).strftime("%Y-%m-%d")
+    except ValueError as e:
+        return None, str(e)
+    return logic.verify_day(conn, master, day), None
+
+
+@bp.route("/loss")
+def loss():
+    master = request.args.get("master", "").strip()
+    day = request.args.get("day", "").strip()
+    conn = get_db()
+    conn.execute("BEGIN")  # 单个读事务：台账、读数、换表记录来自同一快照
+    try:
+        masters = [
+            r["master"]
+            for r in conn.execute(
+                "SELECT DISTINCT master FROM ledger ORDER BY master"
+            )
+        ]
+        ledger = conn.execute(
+            "SELECT master, sub, start_ts, end_ts FROM ledger"
+            " ORDER BY master, sub, start_ts"
+        ).fetchall()
+        version = data_version(conn)
+        result, error = _loss_query(conn, master, day)
+        if result is not None:
+            day = result["day"]
+    finally:
+        conn.execute("COMMIT")
+    return render_template(
+        "loss.html",
+        masters=masters,
+        ledger=ledger,
+        master=master,
+        day=day,
+        result=result,
+        error=error,
+        version=version,
+    )
+
+
+@bp.route("/api/loss")
+def api_loss():
+    master = request.args.get("master", "").strip()
+    day = request.args.get("day", "").strip()
+    if not master:
+        return jsonify(error="需要 master 参数（总表）"), 400
+    conn = get_db()
+    conn.execute("BEGIN")  # 单个读事务：同一快照
+    try:
+        result, error = _loss_query(conn, master, day)
+        if error:
+            return jsonify(error=error), 400
+        version = data_version(conn)
+    finally:
+        conn.execute("COMMIT")
+    segments = []
+    for seg in result["segments"]:
+        item = {
+            "start": seg["start"],
+            "end": seg["end"],
+            "subs": seg["subs"],
+            "status": seg["status"],
+        }
+        if seg["status"] == "ok":
+            item.update(
+                master_delta=logic.fmt_num(seg["master_delta"]),
+                sub_deltas={s: logic.fmt_num(d) for s, d in seg["sub_deltas"]},
+                diff=logic.fmt_num(seg["diff"]),
+            )
+        elif seg["status"] == "blocked":
+            item.update(missing=seg["missing"], swaps=seg["swaps"])
+        segments.append(item)
+    return jsonify(
+        master=result["master"],
+        day=result["day"],
+        version=version,
+        segments=segments,
+        total_diff=(
+            logic.fmt_num(result["total"]) if result["total"] is not None else None
+        ),
     )

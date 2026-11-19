@@ -25,5 +25,6 @@ def create_app(config=None):
 
     app.add_template_filter(logic.fmt_num, "fmt_num")
     app.add_template_filter(logic.fmt_ts, "fmt_ts")
+    app.add_template_filter(logic.fmt_sign, "fmt_sign")
 
     return app
